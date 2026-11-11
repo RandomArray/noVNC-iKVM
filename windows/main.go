@@ -35,7 +35,7 @@ var version = "dev"
 //go:embed web
 var webFiles embed.FS
 
-//go:embed launcher.html launcher.js
+//go:embed launcher.html launcher.js icon/icon-256.png
 var launcherFiles embed.FS
 
 const defaultKVMPort = "5900"
@@ -138,6 +138,8 @@ func (s *server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		serveEmbedded(w, launcherFiles, "launcher.html", "text/html; charset=utf-8")
 	case "/launcher.js":
 		serveEmbedded(w, launcherFiles, "launcher.js", "text/javascript; charset=utf-8")
+	case "/launcher-icon.png":
+		serveEmbedded(w, launcherFiles, "icon/icon-256.png", "image/png")
 	case "/vnc.html":
 		s.serveViewer(w)
 	default:

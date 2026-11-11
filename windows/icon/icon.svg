@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2d6cdf"/>
+      <stop offset="1" stop-color="#173a7a"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1b2a"/>
+      <stop offset="1" stop-color="#05101b"/>
+    </linearGradient>
+    <linearGradient id="bezel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f7fb"/>
+      <stop offset="1" stop-color="#c9d4e2"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <rect x="8" y="8" width="240" height="120" rx="52" fill="#fff" opacity="0.06"/>
+
+  <!-- monitor -->
+  <g filter="url(#shadow)">
+    <rect x="34" y="46" width="188" height="132" rx="16" fill="url(#bezel)"/>
+    <rect x="46" y="58" width="164" height="108" rx="7" fill="url(#screen)"/>
+    <rect x="114" y="178" width="28" height="18" fill="#c9d4e2"/>
+    <rect x="84" y="194" width="88" height="14" rx="7" fill="url(#bezel)"/>
+  </g>
+
+  <!-- prompt -->
+  <g filter="url(#glow)" stroke="#3ef08a" stroke-width="15" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M72 88 L102 112 L72 136"/>
+  </g>
+  <rect x="116" y="128" width="40" height="14" rx="3" fill="#3ef08a" filter="url(#glow)"/>
+
+  <!-- server badge -->
+  <g filter="url(#shadow)">
+    <circle cx="198" cy="190" r="42" fill="#ff7a1a"/>
+    <circle cx="198" cy="190" r="42" fill="none" stroke="#fff" stroke-width="6"/>
+    <rect x="176" y="170" width="44" height="12" rx="3" fill="#fff"/>
+    <rect x="176" y="186" width="44" height="12" rx="3" fill="#fff"/>
+    <rect x="176" y="202" width="44" height="6" rx="3" fill="#fff" opacity="0"/>
+    <circle cx="211" cy="176" r="2.6" fill="#ff7a1a"/>
+    <circle cx="211" cy="192" r="2.6" fill="#ff7a1a"/>
+    <path d="M198 198 L198 214 M188 214 L208 214" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+  </g>
+</svg>

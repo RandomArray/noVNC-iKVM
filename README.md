@@ -68,8 +68,14 @@ or other users from using it as a proxy.
 Build it on Linux, macOS or WSL with Go installed:
 
 ```
+go install github.com/tc-hib/go-winres@v0.3.3   # once; adds the icon and file details
 windows/build.sh        # writes windows/dist/noVNC-iKVM.exe (x64) and an ARM64 build
 ```
+
+The icon's sources are `windows/icon/icon.svg` (48 px and up) and
+`icon-small.svg` (16–32 px), which are packed into `windows/icon/icon.ico`.
+Releases are tagged `ikvm-vX.Y.Z`, and the build stamps that version into
+the exe.
 
 The executable isn't code-signed, so Windows SmartScreen warns the first
 time it's run from a download or network share. Signing it with your
