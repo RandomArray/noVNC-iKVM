@@ -179,7 +179,7 @@ const UI = {
         UI.initSetting('password');
         UI.initSetting('autoconnect', false);
         UI.initSetting('view_clip', false);
-        UI.initSetting('resize', 'off');
+        UI.initSetting('resize', 'scale');
         UI.initSetting('quality', 6);
         UI.initSetting('compression', 2);
         UI.initSetting('shared', true);
@@ -351,6 +351,13 @@ const UI = {
             .addEventListener('click', () => UI.rfb && UI.rfb.cancelTyping());
         document.getElementById("noVNC_screenshot_button")
             .addEventListener('click', UI.screenshot);
+        document.getElementById("noVNC_refresh_button")
+            .addEventListener('click', () => {
+                if (UI.rfb) {
+                    UI.rfb.refreshScreen();
+                    UI.rfb.focus();
+                }
+            });
     },
 
     // Add a call to save settings when the element changes,

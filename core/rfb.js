@@ -165,6 +165,7 @@ export default class RFB extends EventTargetMixin {
         // ATEN iKVM state
         this._atenEncoding = encodings.encodingAtenHermon; // what "0" means
         this._atenScreenOn = null;      // null = unknown
+        this._atenFullUpdate = false;   // ask for a full frame next time
         this._atenScreenOff = { stage: 'prelude', len: 0, timer: null };
         this._atenVideoSettings = null;
         this._atenWatchdog = null;      // re-requests video if the BMC goes quiet
@@ -591,6 +592,19 @@ export default class RFB extends EventTargetMixin {
 
     // True when connected to an ATEN iKVM BMC (Supermicro and others)
     get isAtenIKVM() { return this._rfbAtenIKVM; }
+
+    // Ask the server to send the whole screen again, e.g. when parts
+    // of the picture look stale
+    refreshScreen() {
+        if (this._rfbConnectionState !== 'connected') { return; }
+        if (this._rfbAtenIKVM) {
+            // Sent once the current update finishes, so requests don't pile up
+            this._atenFullUpdate = true;
+        } else {
+            RFB.messages.fbUpdateRequest(this._sock, false, 0, 0,
+                                         this._fbWidth, this._fbHeight);
+        }
+    }
 
     // Keyboard shortcut that types the local clipboard on the remote
     // keyboard: "ctrl+shift+v" (default), "ctrl+v" or "none".
@@ -3139,10 +3153,24 @@ export default class RFB extends EventTargetMixin {
         }
         this._FBU.encoding = enc;
 
+        // The first frame of a connection is always complete
+        const firstFrame = this._atenScreenOn === null;
+
+        if (this._atenScreenOn === false) {
+            // Coming back from "no signal": the BMC only sends tiles it
+            // thinks changed, so ask for everything once this update is done
+            this._atenFullUpdate = true;
+        }
         this._setAtenScreenOn(true);
 
         if (width !== this._fbWidth || height !== this._fbHeight) {
+            // The host switched video modes. Don't leave the old mode's
+            // picture around where the BMC doesn't send new tiles.
             this._resize(width, height);
+            this._display.fillRect(0, 0, width, height, [0, 0, 0]);
+            if (!firstFrame) {
+                this._atenFullUpdate = true;
+            }
         }
 
         return this._handleDataRect();
@@ -3231,6 +3259,11 @@ export default class RFB extends EventTargetMixin {
     _atenRequestUpdate(incremental) {
         clearTimeout(this._atenWatchdog);
         this._atenWatchdog = null;
+
+        if (this._atenFullUpdate) {
+            this._atenFullUpdate = false;
+            incremental = false;
+        }
 
         const send = () => {
             if (this._rfbConnectionState !== 'connected') { return; }

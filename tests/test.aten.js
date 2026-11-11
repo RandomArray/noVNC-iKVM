@@ -324,6 +324,44 @@ describe('ATEN iKVM support', function () {
             expect(sent()).to.deep.equal([3, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
         });
 
+        it('clears the screen and asks for a full frame when the video mode changes', function () {
+            connect();
+            const payload = [];
+            for (let i = 0; i < 4 * 2; i++) payload.push(...px(31, 31, 31));
+            recv(fbu(4, 2, 0x59, hermonData(1, 0, payload)));
+            sent();
+            // New mode, only a partial update (no tiles)
+            recv(fbu(6, 3, 0x59, hermonData(0, 0, [])));
+            expect(client._fbWidth).to.equal(6);
+            client._display.flip();
+            const img = client._display.getImageData().data;
+            expect(Array.from(img.slice(0, 4))).to.deep.equal([0, 0, 0, 255]);
+            // Next request is not incremental, then back to incremental
+            expect(sent()).to.deep.equal([3, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+            recv(fbu(6, 3, 0x59, hermonData(0, 0, [])));
+            expect(sent()).to.deep.equal([3, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        });
+
+        it('asks for a full frame when the video signal comes back', function () {
+            connect();
+            recv(fbu(4, 2, 0x59, hermonData(0, 0, [])));
+            sent();
+            recv(fbu(64896, 65056, 0x59, []));
+            clock.tick(600);
+            sent();
+            recv(fbu(4, 2, 0x59, hermonData(0, 0, [])));
+            expect(sent()).to.deep.equal([3, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        });
+
+        it('refreshes the whole screen on request', function () {
+            connect();
+            recv(fbu(4, 2, 0x59, hermonData(0, 0, [])));
+            sent();
+            client.refreshScreen();
+            recv(fbu(4, 2, 0x59, hermonData(0, 0, [])));
+            expect(sent()).to.deep.equal([3, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        });
+
         it('treats encoding 0 as the previous ATEN encoding', function () {
             connect();
             recv(fbu(4, 2, 0, [0, 0, 0, 0, 0, 0, 0, 0]));
