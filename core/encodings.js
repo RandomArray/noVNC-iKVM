@@ -17,6 +17,11 @@ export const encodings = {
     encodingTightPNG: -260,
     encodingJPEG: 21,
     encodingH264: 50,
+    encodingAtenAST2100: 0x57,
+    encodingAtenASTJPEG: 0x58,
+    encodingAtenHermon: 0x59,
+    encodingAtenYarkon: 0x60,
+    encodingAtenPilot3: 0x61,
 
     pseudoEncodingQualityLevel9: -23,
     pseudoEncodingQualityLevel0: -32,
@@ -49,6 +54,8 @@ export function encodingName(num) {
         case encodings.encodingTightPNG: return "TightPNG";
         case encodings.encodingJPEG:     return "JPEG";
         case encodings.encodingH264:     return "H.264";
+        case encodings.encodingAtenAST2100: return "ATEN AST2100";
+        case encodings.encodingAtenHermon:  return "ATEN Hermon";
         default:                         return "[unknown encoding " + num + "]";
     }
 }

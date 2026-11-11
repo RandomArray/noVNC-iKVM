@@ -39,6 +39,7 @@ module.exports = (config) => {
       { pattern: 'app/localization.js', included: false, type: 'module' },
       { pattern: 'app/webutil.js', included: false, type: 'module' },
       { pattern: 'core/**/*.js', included: false, type: 'module' },
+      { pattern: 'tests/*.hex', included: false },
       { pattern: 'vendor/pako/**/*.js', included: false, type: 'module' },
       // tests
       { pattern: 'tests/test.*.js', type: 'module' },

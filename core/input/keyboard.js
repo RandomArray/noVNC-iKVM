@@ -32,6 +32,10 @@ export default class Keyboard {
         // ===== EVENT HANDLERS =====
 
         this.onkeyevent = () => {}; // Handler for key press/release
+        // Optional function(KeyboardEvent) that returns true for key
+        // presses that should be left to the browser (e.g. a paste
+        // shortcut) instead of being sent to the server
+        this.shortcutFilter = null;
     }
 
     // ===== PRIVATE METHODS =====
@@ -85,6 +89,11 @@ export default class Keyboard {
     }
 
     _handleKeyDown(e) {
+        if (this.shortcutFilter && this.shortcutFilter(e)) {
+            Log.Debug("Leaving key " + e.code + " to the browser");
+            return;
+        }
+
         const code = this._getKeyCode(e);
         let keysym = KeyboardUtil.getKeysym(e);
         let numlock = e.getModifierState('NumLock');
@@ -251,6 +260,11 @@ export default class Keyboard {
             clearTimeout(this._altGrTimeout);
             this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
         }
+    }
+
+    // Release every key we think is pressed on the remote side
+    releaseAllKeys() {
+        this._allKeysUp();
     }
 
     _allKeysUp() {

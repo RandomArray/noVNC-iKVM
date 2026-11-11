@@ -37,6 +37,9 @@ import TightPNGDecoder from "./decoders/tightpng.js";
 import ZRLEDecoder from "./decoders/zrle.js";
 import JPEGDecoder from "./decoders/jpeg.js";
 import H264Decoder from "./decoders/h264.js";
+import AtenHermonDecoder from "./decoders/atenhermon.js";
+import AtenAST2100Decoder from "./decoders/atenast2100.js";
+import { keyEventToHID, charToHID, HID_LEFT_SHIFT } from "./input/hidcodes.js";
 
 // How many seconds to wait for a disconnect to finish
 const DISCONNECT_TIMEOUT = 3;
@@ -60,6 +63,8 @@ const securityTypeNone              = 1;
 const securityTypeVNCAuth           = 2;
 const securityTypeRA2ne             = 6;
 const securityTypeTight             = 16;
+// Not a real RFB security type: ATEN iKVM pretends to be Tight (16)
+const securityTypeAtenIKVM          = "aten";
 const securityTypeVeNCrypt          = 19;
 const securityTypeXVP               = 22;
 const securityTypeARD               = 30;
@@ -131,6 +136,9 @@ export default class RFB extends EventTargetMixin {
         this._rfbVersion = 0;
         this._rfbMaxVersion = 3.8;
         this._rfbTightVNC = false;
+        this._rfbAtenIKVM = false;      // ATEN iKVM BMC (Supermicro etc.)
+        this._atenAuthConsumed = 0;
+        this._serverSecurityTypes = [];
         this._rfbVeNCryptState = 0;
         this._rfbXvpVer = 0;
 
@@ -153,6 +161,20 @@ export default class RFB extends EventTargetMixin {
         this._lastResize = 0;
 
         this._qemuExtKeyEventSupported = false;
+
+        // ATEN iKVM state
+        this._atenEncoding = encodings.encodingAtenHermon; // what "0" means
+        this._atenScreenOn = null;      // null = unknown
+        this._atenScreenOff = { stage: 'prelude', len: 0, timer: null };
+        this._atenVideoSettings = null;
+        this._atenWatchdog = null;      // re-requests video if the BMC goes quiet
+        this._atenWatchdogMisses = 0;
+        this._atenKeysDown = new Set(); // HID usages currently held down
+        this._lastReceive = 0;
+
+        // Paste-as-keystrokes state
+        this._typing = null;
+        this._typingDelay = 8;          // ms between key events
 
         this._extendedPointerEventSupported = false;
 
@@ -208,6 +230,7 @@ export default class RFB extends EventTargetMixin {
             handleMouse: this._handleMouse.bind(this),
             handleWheel: this._handleWheel.bind(this),
             handleGesture: this._handleGesture.bind(this),
+            handlePaste: this._handlePaste.bind(this),
             handleRSAAESCredentialsRequired: this._handleRSAAESCredentialsRequired.bind(this),
             handleRSAAESServerVerification: this._handleRSAAESServerVerification.bind(this),
         };
@@ -256,6 +279,10 @@ export default class RFB extends EventTargetMixin {
         this._decoders[encodings.encodingZRLE] = new ZRLEDecoder();
         this._decoders[encodings.encodingJPEG] = new JPEGDecoder();
         this._decoders[encodings.encodingH264] = new H264Decoder();
+        this._decoders[encodings.encodingAtenHermon] = new AtenHermonDecoder();
+        this._decoders[encodings.encodingAtenAST2100] = new AtenAST2100Decoder();
+        this._decoders[encodings.encodingAtenAST2100].onvideosettings =
+            this._handleAtenVideoSettings.bind(this);
 
         // NB: nothing that needs explicit teardown should be done
         // before this point, since this can throw an exception
@@ -268,6 +295,8 @@ export default class RFB extends EventTargetMixin {
 
         this._keyboard = new Keyboard(this._canvas);
         this._keyboard.onkeyevent = this._handleKeyEvent.bind(this);
+        this._keyboard.shortcutFilter = this._isPasteShortcut.bind(this);
+        this._pasteShortcut = "ctrl+shift+v";
         this._remoteCapsLock = null; // Null indicates unknown or irrelevant
         this._remoteNumLock = null;
 
@@ -471,6 +500,33 @@ export default class RFB extends EventTargetMixin {
             return;
         }
 
+        if (this._rfbAtenIKVM) {
+            // No physical key (on-screen/mobile keyboards, IMEs): type the
+            // character, adding Shift as needed, when the key goes down.
+            if ((!code || code === 'Unidentified') &&
+                keysym >= 0x20 && keysym <= 0x7e) {
+                if (down) {
+                    this._typeChar(String.fromCharCode(keysym));
+                }
+                return;
+            }
+
+            const hid = keyEventToHID(keysym, code);
+            if (hid === null) {
+                Log.Warn("No USB HID usage for key (keysym " + keysym +
+                         ", code " + code + "), not sending it");
+                return;
+            }
+            Log.Debug("Sending HID key (" + (down ? "down" : "up") + "): " + hid);
+            if (down) {
+                this._atenKeysDown.add(hid);
+            } else {
+                this._atenKeysDown.delete(hid);
+            }
+            RFB.messages.atenKeyEvent(this._sock, hid, down);
+            return;
+        }
+
         const scancode = XtScancode[code];
 
         if (this._qemuExtKeyEventSupported && scancode) {
@@ -532,6 +588,225 @@ export default class RFB extends EventTargetMixin {
             RFB.messages.clientCutText(this._sock, data);
         }
     }
+
+    // True when connected to an ATEN iKVM BMC (Supermicro and others)
+    get isAtenIKVM() { return this._rfbAtenIKVM; }
+
+    // Keyboard shortcut that types the local clipboard on the remote
+    // keyboard: "ctrl+shift+v" (default), "ctrl+v" or "none".
+    // Cmd is accepted in place of Ctrl on macOS.
+    get pasteShortcut() { return this._pasteShortcut; }
+    set pasteShortcut(shortcut) {
+        if (["ctrl+shift+v", "ctrl+v", "none"].indexOf(shortcut) === -1) {
+            throw new Error("Invalid paste shortcut: " + shortcut);
+        }
+        this._pasteShortcut = shortcut;
+    }
+
+    // Milliseconds between key events when typing text. BMCs turn every
+    // event into a USB keyboard report and drop events that come in
+    // faster than they can deliver them.
+    get typingDelay() { return this._typingDelay; }
+    set typingDelay(delay) {
+        this._typingDelay = Math.max(0, Number(delay) || 0);
+    }
+
+    get typing() { return this._typing !== null; }
+
+    // Type text on the remote keyboard as if it was typed by hand.
+    // Unlike clipboardPasteFrom() this works with servers without a
+    // clipboard, like BMC KVMs, BIOS screens and text consoles.
+    // Returns a promise for { typed, skipped, cancelled }. Characters
+    // that can't be typed are skipped. ATEN iKVM servers emulate a USB
+    // keyboard, so text is typed as on a US keyboard layout.
+    typeText(text) {
+        const result = { typed: 0, skipped: 0, cancelled: false };
+        if (this._rfbConnectionState !== 'connected' || this._viewOnly) {
+            result.cancelled = true;
+            return Promise.resolve(result);
+        }
+
+        this.cancelTyping();
+
+        const chars = Array.from(String(text).replace(/\r\n?/g, "\n"));
+
+        // Turn the text into key events up front. Each event remembers
+        // how many characters are done once it has been sent.
+        const events = [];
+        const shiftState = { held: false };
+        chars.forEach((ch, i) => {
+            const evs = this._charKeyEvents(ch, shiftState);
+            if (evs === null) {
+                result.skipped++;
+                return;
+            }
+            result.typed++;
+            for (const ev of evs) {
+                events.push(ev);
+            }
+            events[events.length - 1].done = i + 1;
+        });
+        if (shiftState.held) {
+            events.push({ hid: HID_LEFT_SHIFT, down: false, done: chars.length });
+        }
+
+        // Don't let held modifiers (e.g. from the paste shortcut) turn
+        // the text into shortcuts on the remote side.
+        this._releaseRemoteKeys();
+
+        return new Promise((resolve) => {
+            let pos = 0;
+            let done = 0;
+            const job = {
+                timer: null,
+                finish: (cancelled) => {
+                    clearTimeout(job.timer);
+                    if (this._typing === job) { this._typing = null; }
+                    // Never leave Shift stuck down
+                    if (cancelled && this._rfbAtenIKVM &&
+                        this._rfbConnectionState === 'connected') {
+                        RFB.messages.atenKeyEvent(this._sock, HID_LEFT_SHIFT, false);
+                    }
+                    result.cancelled = cancelled;
+                    this._dispatchTyping(cancelled ? done : chars.length,
+                                         chars.length, true);
+                    resolve(result);
+                },
+            };
+            this._typing = job;
+
+            const step = () => {
+                job.timer = null;
+                if (this._rfbConnectionState !== 'connected') {
+                    job.finish(true);
+                    return;
+                }
+                if (pos >= events.length) {
+                    job.finish(false);
+                    return;
+                }
+                const ev = events[pos++];
+                if ('hid' in ev) {
+                    RFB.messages.atenKeyEvent(this._sock, ev.hid, ev.down);
+                } else {
+                    this.sendKey(ev.keysym, null, ev.down);
+                }
+                if (ev.done !== undefined) {
+                    done = ev.done;
+                    if (done % 10 === 0) {
+                        this._dispatchTyping(done, chars.length, false);
+                    }
+                }
+                job.timer = setTimeout(step, this._typingDelay);
+            };
+
+            this._dispatchTyping(0, chars.length, false);
+            step();
+        });
+    }
+
+    cancelTyping() {
+        if (this._typing !== null) {
+            this._typing.finish(true);
+        }
+    }
+
+    _dispatchTyping(done, total, finished) {
+        this.dispatchEvent(new CustomEvent(
+            "typing",
+            { detail: { done: done, total: total, finished: finished } }));
+    }
+
+    // Key events that type a character, or null if it can't be typed.
+    // For ATEN, Shift is kept held across runs of shifted characters
+    // (tracked in shiftState) to keep the number of events down.
+    _charKeyEvents(ch, shiftState) {
+        if (this._rfbAtenIKVM) {
+            const key = charToHID(ch);
+            if (key === null) { return null; }
+            const evs = [];
+            if (key.shift !== shiftState.held) {
+                evs.push({ hid: HID_LEFT_SHIFT, down: key.shift });
+                shiftState.held = key.shift;
+            }
+            evs.push({ hid: key.hid, down: true });
+            evs.push({ hid: key.hid, down: false });
+            return evs;
+        }
+
+        let keysym;
+        if (ch === "\n") {
+            keysym = KeyTable.XK_Return;
+        } else if (ch === "\t") {
+            keysym = KeyTable.XK_Tab;
+        } else {
+            const cp = ch.codePointAt(0);
+            if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) { return null; }
+            // Latin-1 keysyms match the code point, the rest of
+            // Unicode is mapped into the 0x01000000 range
+            keysym = cp < 0x100 ? cp : (0x01000000 | cp);
+        }
+        return [{ keysym: keysym, down: true }, { keysym: keysym, down: false }];
+    }
+
+    // Type a single character right away (keys without a physical key
+    // code, e.g. from on-screen keyboards)
+    _typeChar(ch) {
+        const shiftState = { held: false };
+        const evs = this._charKeyEvents(ch, shiftState);
+        if (evs === null) { return false; }
+        if (shiftState.held) {
+            evs.push({ hid: HID_LEFT_SHIFT, down: false });
+        }
+        for (const ev of evs) {
+            if ('hid' in ev) {
+                RFB.messages.atenKeyEvent(this._sock, ev.hid, ev.down);
+            } else {
+                this.sendKey(ev.keysym, null, ev.down);
+            }
+        }
+        return true;
+    }
+
+    _releaseRemoteKeys() {
+        this._keyboard.releaseAllKeys();
+        if (this._rfbAtenIKVM) {
+            for (const hid of this._atenKeysDown) {
+                RFB.messages.atenKeyEvent(this._sock, hid, false);
+            }
+            this._atenKeysDown.clear();
+        }
+    }
+
+    _isPasteShortcut(e) {
+        if (this._pasteShortcut === "none" || this._viewOnly) { return false; }
+        if (e.code !== "KeyV" && e.key !== "v" && e.key !== "V") { return false; }
+        const mod = e.ctrlKey || e.metaKey;
+        if (!mod || e.altKey) { return false; }
+        if (this._pasteShortcut === "ctrl+shift+v") { return e.shiftKey; }
+        return !e.shiftKey;
+    }
+
+    _handlePaste(e) {
+        if (this._viewOnly) { return; }
+        e.preventDefault();
+        const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+        if (!text) { return; }
+        this.typeText(text);
+    }
+
+    // ATEN AST2100 only: video quality. luma/chroma are quantization
+    // table selectors 0 (worst) - 11 (best), subsampling is 444 or 422.
+    setAtenVideoSettings(luma, chroma, subsampling) {
+        if (!this._rfbAtenIKVM || this._rfbConnectionState !== 'connected') { return; }
+        if (!(luma >= 0 && luma <= 11) || !(chroma >= 0 && chroma <= 11) ||
+            (subsampling !== 444 && subsampling !== 422)) {
+            throw new Error("Invalid ATEN video settings");
+        }
+        RFB.messages.atenVideoSettings(this._sock, luma, chroma, subsampling);
+    }
+
+    get atenVideoSettings() { return this._atenVideoSettings; }
 
     getImageData() {
         return this._display.getImageData();
@@ -597,6 +872,9 @@ export default class RFB extends EventTargetMixin {
         // Wheel events
         this._canvas.addEventListener("wheel", this._eventHandlers.handleWheel);
 
+        // Paste (via the paste shortcut) types the clipboard text
+        this._canvas.addEventListener("paste", this._eventHandlers.handlePaste);
+
         // Gesture events
         this._canvas.addEventListener("gesturestart", this._eventHandlers.handleGesture);
         this._canvas.addEventListener("gesturemove", this._eventHandlers.handleGesture);
@@ -612,6 +890,7 @@ export default class RFB extends EventTargetMixin {
         this._canvas.removeEventListener("gesturemove", this._eventHandlers.handleGesture);
         this._canvas.removeEventListener("gestureend", this._eventHandlers.handleGesture);
         this._canvas.removeEventListener("wheel", this._eventHandlers.handleWheel);
+        this._canvas.removeEventListener("paste", this._eventHandlers.handlePaste);
         this._canvas.removeEventListener('mousedown', this._eventHandlers.handleMouse);
         this._canvas.removeEventListener('mouseup', this._eventHandlers.handleMouse);
         this._canvas.removeEventListener('mousemove', this._eventHandlers.handleMouse);
@@ -635,6 +914,10 @@ export default class RFB extends EventTargetMixin {
         }
         clearTimeout(this._resizeTimeout);
         clearTimeout(this._mouseMoveTimer);
+        clearTimeout(this._atenWatchdog);
+        this._atenWatchdog = null;
+        this._atenResetScreenOff();
+        this.cancelTyping();
         Log.Debug("<< RFB.disconnect");
     }
 
@@ -988,6 +1271,8 @@ export default class RFB extends EventTargetMixin {
             return;
         }
 
+        this._lastReceive = Date.now();
+
         switch (this._rfbConnectionState) {
             case 'disconnected':
                 Log.Error("Got data while disconnected");
@@ -1210,6 +1495,12 @@ export default class RFB extends EventTargetMixin {
         // Highest bit in mask is never sent to the server
         if (mask & 0x8000) {
             throw new Error("Illegal mouse button mask (mask: " + mask + ")");
+        }
+
+        if (this._rfbAtenIKVM) {
+            RFB.messages.atenPointerEvent(this._sock, this._display.absX(x),
+                                          this._display.absY(y), mask & 0xff);
+            return;
         }
 
         let extendedMouseButtons = mask & 0x7f80;
@@ -1577,6 +1868,7 @@ export default class RFB extends EventTargetMixin {
 
             const types = this._sock.rQshiftBytes(numTypes);
             Log.Debug("Server security types: " + types);
+            this._serverSecurityTypes = Array.from(types);
 
             // Look for a matching security type in the order that the
             // server prefers
@@ -1922,9 +2214,70 @@ export default class RFB extends EventTargetMixin {
         }
     }
 
+    // ATEN iKVM servers claim to speak Tight security (16) but then send
+    // 24 bytes of something else and expect a fixed size username and
+    // password. Tell them apart from real TightVNC servers by looking at
+    // what would be the tunnel and sub-auth counts.
+    _onlyOffersTight() {
+        return this._rfbVersion === 3.8 &&
+               this._serverSecurityTypes.length === 1 &&
+               this._serverSecurityTypes[0] === securityTypeTight;
+    }
+
+    static _peek32(sock, offset) {
+        const b = sock.rQpeekBytes(offset + 4, false);
+        return ((b[offset] << 24) | (b[offset + 1] << 16) |
+                (b[offset + 2] << 8) | b[offset + 3]) >>> 0;
+    }
+
+    _negotiateAtenAuth() {
+        // The server sends 24 bytes we don't understand (part of which
+        // we may already have read as Tight counts), then waits for a
+        // 24 byte username and a 24 byte password.
+        const remaining = 24 - this._atenAuthConsumed;
+        if (this._sock.rQwait("ATEN iKVM auth", remaining)) { return false; }
+
+        if (this._rfbCredentials.username === undefined ||
+            this._rfbCredentials.password === undefined) {
+            this.dispatchEvent(new CustomEvent(
+                "credentialsrequired",
+                { detail: { types: ["username", "password"] } }));
+            return false;
+        }
+
+        this._sock.rQskipBytes(remaining);
+        this._atenAuthConsumed = 24;
+
+        const field = (str, what) => {
+            let bytes = encodeUTF8(str);
+            if (bytes.length > 24) {
+                Log.Warn("ATEN iKVM " + what + " is longer than 24 bytes, truncating");
+                bytes = bytes.substring(0, 24);
+            }
+            return bytes + "\x00".repeat(24 - bytes.length);
+        };
+
+        this._sock.sQpushString(field(this._rfbCredentials.username, "username"));
+        this._sock.sQpushString(field(this._rfbCredentials.password, "password"));
+        this._sock.flush();
+
+        this._rfbInitState = "SecurityResult";
+        return true;
+    }
+
     _negotiateTightAuth() {
         if (!this._rfbTightVNC) {  // first pass, do the tunnel negotiation
             if (this._sock.rQwait("num tunnels", 4)) { return false; }
+
+            // Older Winbond/Nuvoton (Hermon) ATEN BMCs send garbage instead
+            // of a tunnel count. TightVNC only knows a handful of types.
+            if (this._onlyOffersTight() && RFB._peek32(this._sock, 0) > 0x1000000) {
+                Log.Info("Detected ATEN iKVM server (older BMC)");
+                this._rfbAtenIKVM = true;
+                this._rfbAuthScheme = securityTypeAtenIKVM;
+                this._atenAuthConsumed = 0;
+                return this._negotiateAtenAuth();
+            }
             const numTunnels = this._sock.rQshift32();
             if (numTunnels > 0 && this._sock.rQwait("tunnel capabilities", 16 * numTunnels, 4)) { return false; }
 
@@ -1938,6 +2291,21 @@ export default class RFB extends EventTargetMixin {
 
         // second pass, do the sub-auth negotiation
         if (this._sock.rQwait("sub auth count", 4)) { return false; }
+
+        // Newer AST2400 ATEN BMCs: zero tunnels, then an odd sub-auth
+        // count. Unlike TightVNC they send all 24 bytes at once, without
+        // any 16 byte capability records for that count.
+        const peekedCount = RFB._peek32(this._sock, 0);
+        if (this._onlyOffersTight() && this._sock.rQlen() >= 20 &&
+            (peekedCount === 0 || (peekedCount & 0xffff) === 0x0100)) {
+            Log.Info("Detected ATEN iKVM server (AST2400 BMC)");
+            this._rfbTightVNC = false;
+            this._rfbAtenIKVM = true;
+            this._rfbAuthScheme = securityTypeAtenIKVM;
+            this._atenAuthConsumed = 4;  // the tunnel count
+            return this._negotiateAtenAuth();
+        }
+
         const subAuthCount = this._sock.rQshift32();
         if (subAuthCount === 0) {  // empty sub-auth list received means 'no auth' subtype selected
             this._rfbInitState = 'SecurityResult';
@@ -2091,6 +2459,9 @@ export default class RFB extends EventTargetMixin {
             case securityTypeTight:
                 return this._negotiateTightAuth();
 
+            case securityTypeAtenIKVM:
+                return this._negotiateAtenAuth();
+
             case securityTypeVeNCrypt:
                 return this._negotiateVeNCryptAuth();
 
@@ -2167,6 +2538,16 @@ export default class RFB extends EventTargetMixin {
         let name = this._sock.rQshiftStr(nameLength);
         name = decodeUTF8(name, true);
 
+        if (this._rfbAtenIKVM) {
+            // 8 unknown bytes, then IKVMVideoEnable, IKVMKMEnable,
+            // IKVMKickEnable and VUSBEnable flags
+            if (this._sock.rQwait('ATEN server init', 12, 24 + nameLength)) { return false; }
+            this._sock.rQskipBytes(8);
+            const flags = this._sock.rQshiftBytes(4);
+            Log.Info("ATEN iKVM: video " + flags[0] + ", keyboard/mouse " + flags[1] +
+                     ", kick " + flags[2] + ", virtual USB " + flags[3]);
+        }
+
         if (this._rfbTightVNC) {
             if (this._sock.rQwait('TightVNC extended server init header', 8, 24 + nameLength)) { return false; }
             // In TightVNC mode, ServerInit message is extended
@@ -2217,6 +2598,16 @@ export default class RFB extends EventTargetMixin {
             this._fbDepth = 8;
         }
 
+        if (this._rfbAtenIKVM) {
+            // ATEN ignores SetPixelFormat and always sends its own format.
+            // The size in ServerInit is meaningless; the real size arrives
+            // with the first frame.
+            this._sendEncodings();
+            this._updateConnectionState('connected');
+            this._atenRequestUpdate(false);
+            return true;
+        }
+
         RFB.messages.pixelFormat(this._sock, this._fbDepth, true);
         this._sendEncodings();
         RFB.messages.fbUpdateRequest(this._sock, false, 0, 0, this._fbWidth, this._fbHeight);
@@ -2227,6 +2618,28 @@ export default class RFB extends EventTargetMixin {
 
     _sendEncodings() {
         const encs = [];
+
+        if (this._rfbAtenIKVM) {
+            // ATEN picks the encoding itself (Hermon or AST2100). This is
+            // the list the original ATEN-capable noVNC sent, which is known
+            // to work across Supermicro X7-X10 boards.
+            RFB.messages.clientEncodings(this._sock, [
+                encodings.encodingCopyRect, encodings.encodingTight,
+                encodings.encodingTightPNG, encodings.encodingHextile,
+                encodings.encodingRRE, encodings.encodingRaw,
+                encodings.encodingAtenHermon, encodings.encodingAtenASTJPEG,
+                encodings.encodingAtenAST2100, encodings.encodingAtenYarkon,
+                encodings.encodingAtenPilot3,
+                encodings.pseudoEncodingDesktopSize,
+                encodings.pseudoEncodingCursor,
+                encodings.pseudoEncodingQualityLevel0 + 6,
+                encodings.pseudoEncodingCompressLevel0 + 9,
+                encodings.pseudoEncodingLastRect,
+                encodings.pseudoEncodingXvp,
+                encodings.pseudoEncodingExtendedDesktopSize,
+            ]);
+            return;
+        }
 
         // In preference order
         encs.push(encodings.encodingCopyRect);
@@ -2564,11 +2977,18 @@ export default class RFB extends EventTargetMixin {
             msgType = this._sock.rQshift8();
         }
 
+        if (this._rfbAtenIKVM && msgType !== 0) {
+            const handled = this._handleAtenMsg(msgType);
+            if (handled !== undefined) { return handled; }
+        }
+
         let first, ret;
         switch (msgType) {
             case 0:  // FramebufferUpdate
                 ret = this._framebufferUpdate();
-                if (ret && !this._enabledContinuousUpdates) {
+                if (ret && this._rfbAtenIKVM) {
+                    this._atenRequestUpdate(true);
+                } else if (ret && !this._enabledContinuousUpdates) {
                     RFB.messages.fbUpdateRequest(this._sock, true, 0, 0,
                                                  this._fbWidth, this._fbHeight);
                 }
@@ -2663,7 +3083,206 @@ export default class RFB extends EventTargetMixin {
         return true;  // We finished this FBU
     }
 
+    // ===== ATEN iKVM =====
+
+    // ATEN specific server messages. Returns undefined for message
+    // types that are not ATEN specific.
+    _handleAtenMsg(msgType) {
+        const lengths = {
+            4: 20,      // Front ground event
+            22: 1,      // Keep alive
+            51: 4,      // Video get info
+            55: 2,      // Mouse get info
+            57: 264,    // Session message
+            60: 8,      // Get viewer language
+        };
+        if (!(msgType in lengths)) { return undefined; }
+        if (this._sock.rQwait("ATEN message " + msgType, lengths[msgType], 1)) {
+            return false;
+        }
+
+        if (msgType === 57) {
+            const kind = this._sock.rQshift32();
+            const id = this._sock.rQshift32();
+            // A C string followed by garbage
+            const text = this._sock.rQshiftStr(256).match(/^[\x20-\x7e]*/)[0].trim();
+            Log.Info("ATEN iKVM session message " + kind + "/" + id + ": " + text);
+            this.dispatchEvent(new CustomEvent(
+                "atensession",
+                { detail: { kind: kind, id: id, text: text } }));
+        } else {
+            Log.Debug("ATEN iKVM message " + msgType);
+            this._sock.rQskipBytes(lengths[msgType]);
+        }
+        return true;
+    }
+
+    _handleAtenRect() {
+        const width = this._FBU.width;
+        const height = this._FBU.height;
+
+        // -640x-480 as unsigned 16 bit: the host's video output is off
+        if (width === 64896 && height === 65056) {
+            return this._handleAtenScreenOff();
+        }
+
+        let enc = this._FBU.encoding;
+        if (enc === encodings.encodingRaw) {
+            // ATEN says 0 when it means "same as before"
+            enc = this._atenEncoding;
+        } else if (enc === encodings.encodingAtenHermon ||
+                   enc === encodings.encodingAtenAST2100) {
+            this._atenEncoding = enc;
+        } else {
+            this._fail("Unsupported ATEN iKVM encoding (" + enc + ")");
+            return false;
+        }
+        this._FBU.encoding = enc;
+
+        this._setAtenScreenOn(true);
+
+        if (width !== this._fbWidth || height !== this._fbHeight) {
+            this._resize(width, height);
+        }
+
+        return this._handleDataRect();
+    }
+
+    // Firmware differs in what follows the header of a "screen off"
+    // rect: nothing, an 8 byte prelude (u32 flags, u32 length), or a
+    // prelude plus an empty 10 byte Hermon header. We tell them apart by
+    // the next byte: ATEN's own messages never start with 0 or 1, and
+    // the server sends no new frame until we ask for one. If nothing
+    // arrives for a moment, the rect had no data.
+    _handleAtenScreenOff() {
+        const off = this._atenScreenOff;
+
+        if (off.stage === 'prelude') {
+            if (this._sock.rQlen() === 0) { return this._atenAwaitScreenOffData(); }
+            if (this._sock.rQpeek8() === 0) {
+                if (this._sock.rQwait("ATEN screen off prelude", 8)) { return false; }
+                this._sock.rQskipBytes(4);
+                off.len = this._sock.rQshift32();
+                off.stage = off.len === 10 ? 'header' : (off.len > 10 ? 'data' : 'done');
+            } else {
+                off.stage = 'done';
+            }
+        }
+
+        if (off.stage === 'header') {
+            if (this._sock.rQlen() === 0) { return this._atenAwaitScreenOffData(); }
+            if (this._sock.rQpeek8() <= 1) {
+                if (this._sock.rQwait("ATEN screen off header", 10)) { return false; }
+                this._sock.rQskipBytes(10);
+            }
+            off.stage = 'done';
+        }
+
+        if (off.stage === 'data') {
+            if (this._sock.rQwait("ATEN screen off data", off.len)) { return false; }
+            this._sock.rQskipBytes(off.len);
+            off.stage = 'done';
+        }
+
+        this._atenResetScreenOff();
+        this._setAtenScreenOn(false);
+        return true;
+    }
+
+    _atenAwaitScreenOffData() {
+        const off = this._atenScreenOff;
+        if (off.timer === null) {
+            off.timer = setTimeout(() => {
+                off.timer = null;
+                if (this._rfbConnectionState !== 'connected' ||
+                    this._sock.rQlen() > 0) {
+                    return;
+                }
+                // Nothing more came, so the rect (and update) is complete
+                this._atenResetScreenOff();
+                this._setAtenScreenOn(false);
+                this._FBU.rects--;
+                this._FBU.encoding = null;
+                if (this._FBU.rects === 0) {
+                    this._display.flip();
+                    this._atenRequestUpdate(true);
+                }
+            }, 100);
+        }
+        return false;
+    }
+
+    _atenResetScreenOff() {
+        clearTimeout(this._atenScreenOff.timer);
+        this._atenScreenOff = { stage: 'prelude', len: 0, timer: null };
+    }
+
+    _setAtenScreenOn(on) {
+        if (this._atenScreenOn === on) { return; }
+        this._atenScreenOn = on;
+        Log.Info("ATEN iKVM: host video " + (on ? "on" : "off"));
+        this.dispatchEvent(new CustomEvent(
+            "videosignal",
+            { detail: { present: on } }));
+    }
+
+    // Ask for the next frame. The BMC paces its own replies, so this
+    // doesn't busy loop, except when the screen is off where we back off.
+    _atenRequestUpdate(incremental) {
+        clearTimeout(this._atenWatchdog);
+        this._atenWatchdog = null;
+
+        const send = () => {
+            if (this._rfbConnectionState !== 'connected') { return; }
+            RFB.messages.fbUpdateRequest(this._sock, incremental,
+                                         0, 0, 0xffff, 0xffff);
+            this._atenWatchdog = setTimeout(this._atenWatchdogFired.bind(this),
+                                            RFB.atenWatchdogTimeout);
+        };
+
+        if (this._atenScreenOn === false) {
+            this._atenWatchdog = setTimeout(send, 500);
+        } else {
+            this._atenWatchdogMisses = 0;
+            send();
+        }
+    }
+
+    // The BMC sometimes stops answering, especially right after another
+    // session ended. Ask again for a full frame, and give up eventually
+    // so that the UI can reconnect.
+    _atenWatchdogFired() {
+        this._atenWatchdog = null;
+        // Still receiving (e.g. a big frame on a slow link)? Keep waiting.
+        if (Date.now() - this._lastReceive < RFB.atenWatchdogTimeout) {
+            this._atenWatchdog = setTimeout(this._atenWatchdogFired.bind(this),
+                                            RFB.atenWatchdogTimeout);
+            return;
+        }
+        this._atenWatchdogMisses++;
+        if (this._atenWatchdogMisses > 3) {
+            this._fail("The BMC stopped sending video");
+            return;
+        }
+        Log.Warn("ATEN iKVM: no video for " + RFB.atenWatchdogTimeout +
+                 "ms, requesting a full update");
+        RFB.messages.fbUpdateRequest(this._sock, false, 0, 0, 0xffff, 0xffff);
+        this._atenWatchdog = setTimeout(this._atenWatchdogFired.bind(this),
+                                        RFB.atenWatchdogTimeout);
+    }
+
+    _handleAtenVideoSettings(settings) {
+        this._atenVideoSettings = settings;
+        this.dispatchEvent(new CustomEvent(
+            "atenvideosettings",
+            { detail: Object.assign({}, settings) }));
+    }
+
     _handleRect() {
+        if (this._rfbAtenIKVM) {
+            return this._handleAtenRect();
+        }
+
         switch (this._FBU.encoding) {
             case encodings.pseudoEncodingLastRect:
                 this._FBU.rects = 1; // Will be decreased when we return
@@ -3073,7 +3692,41 @@ export default class RFB extends EventTargetMixin {
 }
 
 // Class Methods
+// How long to wait for video from an ATEN iKVM BMC before asking again
+RFB.atenWatchdogTimeout = 5000;
+
 RFB.messages = {
+    // ATEN iKVM: u8 type, u8 pad, u8 down, u16 pad, u32 HID usage, 9 pad
+    atenKeyEvent(sock, hid, down) {
+        sock.sQpush8(4);
+        sock.sQpush8(0);
+        sock.sQpush8(down ? 1 : 0);
+        sock.sQpush16(0);
+        sock.sQpush32(hid);
+        sock.sQpushBytes(new Uint8Array(9));
+        sock.flush();
+    },
+
+    // ATEN iKVM: u8 type, u8 pad, u8 buttons, u16 x, u16 y, 11 pad
+    atenPointerEvent(sock, x, y, mask) {
+        sock.sQpush8(5);
+        sock.sQpush8(0);
+        sock.sQpush8(mask);
+        sock.sQpush16(x);
+        sock.sQpush16(y);
+        sock.sQpushBytes(new Uint8Array(11));
+        sock.flush();
+    },
+
+    // ATEN AST2100: choose quantization tables (0-11) and subsampling
+    atenVideoSettings(sock, lumaQt, chromaQt, subsampling) {
+        sock.sQpush8(0x32);
+        sock.sQpush8(lumaQt);
+        sock.sQpush8(chromaQt);
+        sock.sQpush16(subsampling);
+        sock.flush();
+    },
+
     keyEvent(sock, keysym, down) {
         sock.sQpush8(4); // msg-type
         sock.sQpush8(down);
