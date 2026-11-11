@@ -175,6 +175,7 @@ const UI = {
         UI.initSetting('host', '');
         UI.initSetting('port', 0);
         UI.initSetting('encrypt', (window.location.protocol === "https:"));
+        UI.initSetting('username');
         UI.initSetting('password');
         UI.initSetting('autoconnect', false);
         UI.initSetting('view_clip', false);
@@ -187,8 +188,10 @@ const UI = {
         UI.initSetting('show_dot', false);
         UI.initSetting('path', 'websockify');
         UI.initSetting('repeaterID', '');
-        UI.initSetting('reconnect', false);
-        UI.initSetting('reconnect_delay', 5000);
+        UI.initSetting('reconnect', true);
+        UI.initSetting('reconnect_delay', 3000);
+        UI.initSetting('paste_shortcut', 'ctrl+shift+v');
+        UI.initSetting('typing_delay', 8);
     },
     // Adds a link to the label elements on the corresponding input elements
     setupSettingLabels() {
@@ -340,6 +343,14 @@ const UI = {
             .addEventListener('click', UI.toggleClipboardPanel);
         document.getElementById("noVNC_clipboard_text")
             .addEventListener('change', UI.clipboardSend);
+        document.getElementById("noVNC_type_text_button")
+            .addEventListener('click', UI.typeClipboardText);
+        document.getElementById("noVNC_paste_local_button")
+            .addEventListener('click', UI.pasteLocalClipboard);
+        document.getElementById("noVNC_typing_cancel_button")
+            .addEventListener('click', () => UI.rfb && UI.rfb.cancelTyping());
+        document.getElementById("noVNC_screenshot_button")
+            .addEventListener('click', UI.screenshot);
     },
 
     // Add a call to save settings when the element changes,
@@ -379,6 +390,10 @@ const UI = {
         UI.addSettingChangeHandler('logging', UI.updateLogging);
         UI.addSettingChangeHandler('reconnect');
         UI.addSettingChangeHandler('reconnect_delay');
+        UI.addSettingChangeHandler('paste_shortcut');
+        UI.addSettingChangeHandler('paste_shortcut', UI.updatePasteSettings);
+        UI.addSettingChangeHandler('typing_delay');
+        UI.addSettingChangeHandler('typing_delay', UI.updatePasteSettings);
     },
 
     addFullscreenHandlers() {
@@ -1001,10 +1016,114 @@ const UI = {
     },
 
     clipboardSend() {
+        // Servers with a clipboard (normal VNC) get it the usual way.
+        // BMC KVMs have no clipboard; use typeClipboardText() there.
+        if (!UI.rfb || UI.rfb.isAtenIKVM) { return; }
         const text = document.getElementById('noVNC_clipboard_text').value;
         Log.Debug(">> UI.clipboardSend: " + text.substr(0, 40) + "...");
         UI.rfb.clipboardPasteFrom(text);
         Log.Debug("<< UI.clipboardSend");
+    },
+
+    // Type the clipboard panel's text on the remote keyboard
+    typeClipboardText() {
+        if (!UI.rfb) { return; }
+        const text = document.getElementById('noVNC_clipboard_text').value;
+        if (text === "") { return; }
+        UI.closeClipboardPanel();
+        UI.typeText(text);
+    },
+
+    // Type the browser's clipboard on the remote keyboard
+    async pasteLocalClipboard() {
+        if (!UI.rfb) { return; }
+        let text;
+        try {
+            text = await navigator.clipboard.readText();
+        } catch (err) {
+            Log.Warn("Clipboard read failed: " + err);
+            UI.showStatus(_("Can't read your clipboard here. Paste into the box and press \"Type text\", or use the paste shortcut."), 'warn', 6000);
+            return;
+        }
+        if (!text) {
+            UI.showStatus(_("Your clipboard has no text"), 'warn', 3000);
+            return;
+        }
+        document.getElementById('noVNC_clipboard_text').value = text;
+        UI.closeClipboardPanel();
+        UI.typeText(text);
+    },
+
+    async typeText(text) {
+        UI.rfb.focus();
+        const res = await UI.rfb.typeText(text);
+        if (res.skipped > 0) {
+            UI.showStatus(_("Skipped %d character(s) that can't be typed on a US keyboard")
+                .replace('%d', res.skipped), 'warn', 5000);
+        } else if (res.cancelled) {
+            UI.showStatus(_("Typing cancelled"), 'normal', 2000);
+        }
+    },
+
+    updateTyping(e) {
+        const box = document.getElementById('noVNC_typing');
+        if (e.detail.finished || e.detail.total < 20) {
+            box.classList.add('noVNC_hidden');
+            return;
+        }
+        box.classList.remove('noVNC_hidden');
+        document.getElementById('noVNC_typing_text').textContent =
+            _("Typing") + " " + e.detail.done + " / " + e.detail.total;
+        const bar = document.getElementById('noVNC_typing_progress');
+        bar.max = e.detail.total;
+        bar.value = e.detail.done;
+    },
+
+    updatePasteSettings() {
+        const shortcut = UI.getSetting('paste_shortcut');
+        const hint = { 'ctrl+shift+v': 'Ctrl+Shift+V', 'ctrl+v': 'Ctrl+V', 'none': _('(off)') };
+        document.getElementById('noVNC_paste_shortcut_hint').textContent =
+            hint[shortcut] || shortcut;
+        if (!UI.rfb) { return; }
+        try {
+            UI.rfb.pasteShortcut = shortcut;
+        } catch (err) {
+            Log.Warn(err.message);
+        }
+        const delay = parseInt(UI.getSetting('typing_delay'), 10);
+        UI.rfb.typingDelay = isNaN(delay) ? 8 : delay;
+    },
+
+    // Save the screen as a PNG, or copy it to the clipboard with Shift
+    screenshot(e) {
+        if (!UI.rfb || !UI.connected) { return; }
+        const copy = e && e.shiftKey;
+        UI.rfb.toBlob(async (blob) => {
+            if (!blob) { return; }
+            if (copy) {
+                try {
+                    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+                    UI.showStatus(_("Screenshot copied to the clipboard"), 'normal', 2000);
+                    return;
+                } catch (err) {
+                    Log.Warn("Copying screenshot failed: " + err);
+                }
+            }
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const name = (UI.getSetting('host') || 'screen') + '-' + stamp + '.png';
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        }, 'image/png');
+    },
+
+    updateVideoSignal(e) {
+        document.getElementById('noVNC_nosignal')
+            .classList.toggle('noVNC_hidden', e.detail.present);
     },
 
 /* ------^-------
@@ -1043,6 +1162,11 @@ const UI = {
             password = undefined;
         }
 
+        let username = UI.reconnectUsername;
+        if (username === undefined) {
+            username = UI.getSetting('username') || undefined;
+        }
+
         UI.hideStatus();
 
         UI.closeConnectPanel();
@@ -1077,7 +1201,7 @@ const UI = {
                              url.href,
                              { shared: UI.getSetting('shared'),
                                repeaterID: UI.getSetting('repeaterID'),
-                               credentials: { password: password } });
+                               credentials: { username: username, password: password } });
         } catch (exc) {
             Log.Error("Failed to connect to server: " + exc);
             UI.updateVisualState('disconnected');
@@ -1095,12 +1219,15 @@ const UI = {
         UI.rfb.addEventListener("clipboard", UI.clipboardReceive);
         UI.rfb.addEventListener("bell", UI.bell);
         UI.rfb.addEventListener("desktopname", UI.updateDesktopName);
+        UI.rfb.addEventListener("typing", UI.updateTyping);
+        UI.rfb.addEventListener("videosignal", UI.updateVideoSignal);
         UI.rfb.clipViewport = UI.getSetting('view_clip');
         UI.rfb.scaleViewport = UI.getSetting('resize') === 'scale';
         UI.rfb.resizeSession = UI.getSetting('resize') === 'remote';
         UI.rfb.qualityLevel = parseInt(UI.getSetting('quality'));
         UI.rfb.compressionLevel = parseInt(UI.getSetting('compression'));
         UI.rfb.showDotCursor = UI.getSetting('show_dot');
+        UI.updatePasteSettings();
 
         UI.updateViewOnly(); // requires UI.rfb
     },
@@ -1171,6 +1298,9 @@ const UI = {
 
         UI.rfb = undefined;
 
+        document.getElementById('noVNC_nosignal').classList.add('noVNC_hidden');
+        document.getElementById('noVNC_typing').classList.add('noVNC_hidden');
+
         if (!e.detail.clean) {
             UI.updateVisualState('disconnected');
             if (wasConnected) {
@@ -1211,6 +1341,8 @@ const UI = {
         } else {
             msg = _("New connection has been rejected");
         }
+        // Wrong credentials won't get better by retrying
+        UI.inhibitReconnect = true;
         UI.showStatus(msg, 'error');
     },
 
@@ -1272,6 +1404,22 @@ const UI = {
     credentials(e) {
         // FIXME: handle more types
 
+        // Older noVNC-iKVM links passed "password=user:pass". If we only
+        // have that and the server wants both, split it.
+        const types = e.detail.types;
+        const pw = UI.reconnectPassword;
+        if (types.indexOf("username") !== -1 && types.indexOf("password") !== -1 &&
+            !UI.getSetting('username') && UI.reconnectUsername === undefined &&
+            typeof pw === 'string' && pw.indexOf(':') > 0 && !UI.legacyCredsTried) {
+            UI.legacyCredsTried = true;
+            const sep = pw.indexOf(':');
+            UI.reconnectUsername = pw.substring(0, sep);
+            UI.reconnectPassword = pw.substring(sep + 1);
+            UI.rfb.sendCredentials({ username: UI.reconnectUsername,
+                                     password: UI.reconnectPassword });
+            return;
+        }
+
         document.getElementById("noVNC_username_block").classList.remove("noVNC_hidden");
         document.getElementById("noVNC_password_block").classList.remove("noVNC_hidden");
 
@@ -1309,6 +1457,7 @@ const UI = {
         inputElemPassword.value = "";
 
         UI.rfb.sendCredentials({ username: username, password: password });
+        UI.reconnectUsername = username;
         UI.reconnectPassword = password;
         document.getElementById('noVNC_credentials_dlg')
             .classList.remove('noVNC_open');

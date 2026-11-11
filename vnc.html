@@ -13,7 +13,7 @@
     or the fragment:
         http://example.com/#host=HOST&port=PORT&encrypt=1
     -->
-    <title>noVNC</title>
+    <title>noVNC-iKVM</title>
 
     <link rel="icon" type="image/x-icon" href="app/images/icons/novnc.ico">
     <meta name="theme-color" content="#313131">
@@ -184,11 +184,30 @@
                     <img alt="" src="app/images/clipboard.svg"> Clipboard
                 </div>
                 <p class="noVNC_subheading">
-                    Edit clipboard content in the textarea below.
+                    Text here is typed on the remote keyboard.
+                    Shortcut: <kbd id="noVNC_paste_shortcut_hint">Ctrl+Shift+V</kbd>
+                    pastes your clipboard directly.
                 </p>
-                <textarea id="noVNC_clipboard_text" rows=5></textarea>
+                <textarea id="noVNC_clipboard_text" rows=5
+                          spellcheck="false" autocomplete="off"></textarea>
+                <div class="noVNC_clipboard_actions">
+                    <input type="button" id="noVNC_type_text_button"
+                           value="Type text">
+                    <input type="button" id="noVNC_paste_local_button"
+                           value="Paste from my clipboard">
+                </div>
+                <p class="noVNC_subheading noVNC_clipboard_note">
+                    Typed as a US keyboard layout. Copying text from the
+                    remote screen is not possible: an IPMI KVM only sends
+                    pictures. Use the screenshot button instead.
+                </p>
             </div>
             </div>
+
+            <!-- Screenshot -->
+            <input type="image" alt="Screenshot" src="app/images/screenshot.svg"
+                id="noVNC_screenshot_button" class="noVNC_button"
+                title="Save a screenshot (Shift+click copies it)">
 
             <!-- Toggle fullscreen -->
             <input type="image" alt="Full screen" src="app/images/fullscreen.svg"
@@ -234,6 +253,19 @@
                             <option value="scale">Local scaling</option>
                             <option value="remote">Remote resizing</option>
                         </select>
+                    </li>
+                    <li><hr></li>
+                    <li>
+                        <label for="noVNC_setting_paste_shortcut">Paste shortcut:</label>
+                        <select id="noVNC_setting_paste_shortcut">
+                            <option value="ctrl+shift+v">Ctrl+Shift+V</option>
+                            <option value="ctrl+v">Ctrl+V</option>
+                            <option value="none">None</option>
+                        </select>
+                    </li>
+                    <li>
+                        <label for="noVNC_setting_typing_delay">Typing delay (ms per key):</label>
+                        <input id="noVNC_setting_typing_delay" type="number" min="0" max="200">
                     </li>
                     <li><hr></li>
                     <li>
@@ -396,6 +428,19 @@
         <input type="button" id="noVNC_cancel_reconnect_button" value="Cancel">
         </div>
         <div class="noVNC_spinner"></div>
+    </div>
+
+    <!-- Paste progress -->
+    <div id="noVNC_typing" class="noVNC_hidden">
+        <span id="noVNC_typing_text"></span>
+        <progress id="noVNC_typing_progress" max="1" value="0"></progress>
+        <input type="button" id="noVNC_typing_cancel_button" value="Cancel">
+    </div>
+
+    <!-- Shown when the BMC reports the host's video output is off -->
+    <div id="noVNC_nosignal" class="noVNC_hidden">
+        <div>No video signal</div>
+        <div class="noVNC_nosignal_detail">The host is off, rebooting or has blanked its display.</div>
     </div>
 
     <!-- This is where the RFB elements will attach -->
