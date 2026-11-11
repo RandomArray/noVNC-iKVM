@@ -1,0 +1,5 @@
+# One BMC per line: name: host[:port]   (port defaults to 5900)
+# Copy to bmcs.conf and run: ./ikvm.sh -c bmcs.conf
+lab-x9: 192.0.2.10
+# db1: 192.0.2.20
+# db2: 192.0.2.21:5900

@@ -10,3 +10,8 @@ recordings
 *.swp
 *~
 noVNC-*.tgz
+.venv/
+.ikvm-tokens
+bmcs.conf
+websockify.log
+package-lock.json
