@@ -18,7 +18,7 @@ import Keyboard from "../core/input/keyboard.js";
 import RFB from "../core/rfb.js";
 import * as WebUtil from "./webutil.js";
 
-const PAGE_TITLE = "noVNC";
+const PAGE_TITLE = "noVNC-iKVM";
 
 const LINGUAS = ["cs", "de", "el", "es", "fr", "hr", "hu", "it", "ja", "ko", "nl", "pl", "pt_BR", "ru", "sv", "tr", "zh_CN", "zh_TW"];
 
@@ -73,6 +73,10 @@ const UI = {
         }
 
         UI.initSettings();
+
+        if (UI.getSetting('title')) {
+            document.title = UI.getSetting('title') + " - " + PAGE_TITLE;
+        }
 
         // Translate the DOM
         l10n.translateDOM();
@@ -190,6 +194,7 @@ const UI = {
         UI.initSetting('repeaterID', '');
         UI.initSetting('reconnect', true);
         UI.initSetting('reconnect_delay', 3000);
+        UI.initSetting('title', '');
         UI.initSetting('paste_shortcut', 'ctrl+shift+v');
         UI.initSetting('typing_delay', 8);
     },
@@ -1128,6 +1133,16 @@ const UI = {
         }, 'image/png');
     },
 
+    // ATEN BMCs tell each new session about the sessions already
+    // connected (kind 2). Older firmware only gives keyboard and mouse
+    // to the first session, so typing in this one may do nothing.
+    atenSession(e) {
+        if (e.detail.kind !== 2) { return; }
+        const user = e.detail.text.split(/\s+/)[1] || _("someone");
+        UI.showStatus(_("Another console session (%s) is connected to this BMC. On some BMCs only the first session can use the keyboard and mouse.")
+            .replace('%s', user), 'warn', 15000);
+    },
+
     updateVideoSignal(e) {
         document.getElementById('noVNC_nosignal')
             .classList.toggle('noVNC_hidden', e.detail.present);
@@ -1172,6 +1187,24 @@ const UI = {
         let username = UI.reconnectUsername;
         if (username === undefined) {
             username = UI.getSetting('username') || undefined;
+        }
+
+        // A launcher page on the same origin can hand over credentials
+        // once, so they don't have to go in the URL
+        try {
+            const handoff = sessionStorage.getItem('novnc_credentials');
+            if (handoff !== null) {
+                sessionStorage.removeItem('novnc_credentials');
+                const creds = JSON.parse(handoff);
+                if (username === undefined && creds.username) {
+                    username = UI.reconnectUsername = creds.username;
+                }
+                if (password === undefined && typeof creds.password === 'string') {
+                    password = UI.reconnectPassword = creds.password;
+                }
+            }
+        } catch (err) {
+            Log.Warn("Ignoring launcher credentials: " + err);
         }
 
         UI.hideStatus();
@@ -1228,6 +1261,7 @@ const UI = {
         UI.rfb.addEventListener("desktopname", UI.updateDesktopName);
         UI.rfb.addEventListener("typing", UI.updateTyping);
         UI.rfb.addEventListener("videosignal", UI.updateVideoSignal);
+        UI.rfb.addEventListener("atensession", UI.atenSession);
         UI.rfb.clipViewport = UI.getSetting('view_clip');
         UI.rfb.scaleViewport = UI.getSetting('resize') === 'scale';
         UI.rfb.resizeSession = UI.getSetting('resize') === 'remote';
@@ -1331,7 +1365,7 @@ const UI = {
 
         UI.updateBeforeUnload();
 
-        document.title = PAGE_TITLE;
+        document.title = (UI.getSetting('title') ? UI.getSetting('title') + " - " : "") + PAGE_TITLE;
 
         UI.openControlbar();
         UI.openConnectPanel();
@@ -1945,8 +1979,10 @@ const UI = {
 
     updateDesktopName(e) {
         UI.desktopName = e.detail.name;
-        // Display the desktop name in the document title
-        document.title = e.detail.name + " - " + PAGE_TITLE;
+        // Display the desktop name in the document title, unless the
+        // page was given a title (e.g. the BMC's address)
+        const title = UI.getSetting('title');
+        document.title = (title || e.detail.name) + " - " + PAGE_TITLE;
     },
 
     bell(e) {

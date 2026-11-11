@@ -51,6 +51,30 @@ The launcher prints one URL per BMC. By default it only listens on
 127.0.0.1. Use `-a` to listen on all interfaces, but only on a trusted
 management network: anyone who can reach the port can reach your BMCs.
 
+### Windows: single executable
+
+`noVNC-iKVM.exe` is a single file with the viewer built in. There's
+nothing to install and no Python is needed. Double-click it and a window
+opens asking for the BMC address, username and password. It uses Edge in
+app mode, which every Windows 11 machine has. Recent BMCs are remembered
+(not their passwords), and closing the window ends the program.
+
+`noVNC-iKVM.exe 10.0.0.10` (or a shortcut with the address as an
+argument) opens the form with the address already filled in.
+
+It listens on 127.0.0.1 only. A random secret for each run stops web pages
+or other users from using it as a proxy.
+
+Build it on Linux, macOS or WSL with Go installed:
+
+```
+windows/build.sh        # writes windows/dist/noVNC-iKVM.exe (x64) and an ARM64 build
+```
+
+The executable isn't code-signed, so Windows SmartScreen warns the first
+time it's run from a download or network share. Signing it with your
+organisation's code-signing certificate (`signtool sign ...`) avoids that.
+
 ### URL parameters
 
 On top of the usual noVNC parameters (`host`, `port`, `path`,
