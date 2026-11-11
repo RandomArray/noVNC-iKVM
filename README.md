@@ -1,4 +1,14 @@
-## noVNC-iKVM: browser console for IPMI/BMC KVMs
+<p align="center">
+  <img src="windows/icon/icon-256.png" alt="noVNC-iKVM icon" width="128" height="128">
+</p>
+
+<h1 align="center">noVNC-iKVM</h1>
+
+<p align="center">
+  Browser-based remote console for IPMI/BMC KVMs: Supermicro and other ATEN iKVM servers, no Java needed.<br>
+  <a href="https://github.com/RandomArray/noVNC-iKVM/releases/latest"><b>Download for Windows</b></a>
+</p>
+
 
 A browser-based remote console for server BMCs whose KVM uses the
 **ATEN iKVM** protocol: Supermicro X7–X10 boards and other ATEN-based
